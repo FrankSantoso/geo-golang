@@ -1,14 +1,14 @@
 package geo
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"io/ioutil"
-	"net/http"
+	"github.com/corpix/uarand"
+	"github.com/valyala/fasthttp"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -17,6 +17,17 @@ const DefaultTimeout = time.Second * 8
 
 // ErrTimeout occurs when no response returned within timeoutInSeconds
 var ErrTimeout = errors.New("TIMEOUT")
+
+var client = &fasthttp.Client{
+	NoDefaultUserAgentHeader:      true,
+	MaxConnsPerHost:               1000000,
+	ReadBufferSize:                8192,
+	WriteBufferSize:               8192,
+	ReadTimeout:                   DefaultTimeout,
+	WriteTimeout:                  DefaultTimeout,
+	MaxIdleConnDuration:           2 * time.Minute,
+	DisableHeaderNamesNormalizing: true,
+}
 
 // EndpointBuilder defines functions that build urls for geocode/reverse geocode
 type EndpointBuilder interface {
@@ -111,35 +122,59 @@ func (g HTTPGeocoder) ReverseGeocode(lat, lng float64) (*Address, error) {
 	}
 }
 
+type commonRequest struct {
+	url string
+	obj ResponseParser
+}
+
 // Response gets response from url
 func response(ctx context.Context, url string, obj ResponseParser) error {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
+	comm := &commonRequest{
+		url,
+		obj,
+	}
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- fetch(comm)
+	}()
+	if err := <-errChan; err != nil {
 		return err
 	}
-	req = req.WithContext(ctx)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-
-	defer resp.Body.Close()
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	body := strings.Trim(string(data), " []")
-	if body == "" {
-		return nil
-	}
-	if err := json.Unmarshal([]byte(body), obj); err != nil {
-		Logger.Printf("payload: %s\n", body)
-		return err
-	}
-
 	return nil
+}
+
+func fetch(c *commonRequest) error {
+	retries := 0
+	res := fasthttp.AcquireResponse()
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+	req.Header.SetMethod("GET")
+	req.Header.SetUserAgent(uarand.GetRandom())
+	req.SetRequestURI(c.url)
+	if err := fasthttp.DoTimeout(req, res, client.ReadTimeout); err != nil {
+		retries++
+		Logger.Printf("Error fetching response, retrying...")
+		if retries < 3 {
+			handleRetries(err, c)
+		}
+		return err
+	}
+
+	bods := bytes.Trim(res.Body(), " []")
+	if err := json.Unmarshal(bods, c.obj); err != nil {
+		return err
+	}
+	fasthttp.ReleaseResponse(res)
+	return nil
+}
+
+func handleRetries(err error, c *commonRequest) {
+	if err == fasthttp.ErrTimeout || err == fasthttp.ErrDialTimeout {
+		client.ReadTimeout += 5 * time.Millisecond
+		fetch(c)
+	} else {
+		return
+	}
 }
 
 // ParseFloat is a helper to parse a string to a float
